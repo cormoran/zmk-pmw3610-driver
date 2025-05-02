@@ -397,9 +397,19 @@ static int pmw3610_report_data(const struct device *dev) {
     int64_t now = k_uptime_get();
 #endif
 
-	int err = pmw3610_read(dev, PMW3610_REG_MOTION_BURST, buf, sizeof(buf));
-    if (err) {
-        return err;
+    if (!config->disable_burst_read) {
+        // Burst mode requires cs pin to reset
+	    int err = pmw3610_read(dev, PMW3610_REG_MOTION_BURST, buf, sizeof(buf));
+        if (err) {
+            return err;
+        }
+    } else {
+        for (size_t i = 0; i < PMW3610_BURST_SIZE; i++) {
+            int err = pmw3610_read(dev, PMW3610_REG_MOTION + i, &buf[i], 1);
+            if (err) {
+                return err;
+            }
+        }
     }
     // LOG_HEXDUMP_DBG(buf, sizeof(buf), "buf");
 
@@ -643,6 +653,7 @@ static int pmw3610_pm_action(const struct device *dev, enum pm_device_action act
         .x_input_code = DT_PROP(DT_DRV_INST(n), x_input_code),                                     \
         .y_input_code = DT_PROP(DT_DRV_INST(n), y_input_code),                                     \
         .force_awake = DT_PROP(DT_DRV_INST(n), force_awake),                                       \
+        .disable_burst_read = DT_PROP(DT_DRV_INST(n), disable_burst_read),                         \
     };                                                                                             \
     PM_DEVICE_DT_INST_DEFINE(n, pmw3610_pm_action);                                                \
     DEVICE_DT_INST_DEFINE(n, pmw3610_init, NULL, &data##n, &config##n, POST_KERNEL,                \
