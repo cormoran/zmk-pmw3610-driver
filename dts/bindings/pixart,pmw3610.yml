@@ -26,4 +26,3 @@ properties:
     type: boolean
   disable-burst-read:
     type: boolean
-    default: false

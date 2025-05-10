@@ -486,7 +486,7 @@ static int pmw3610_report_data(const struct device *dev) {
         }
     }
 
-    return err;
+    return 0;
 }
 
 static void pmw3610_gpio_callback(const struct device *gpiob, struct gpio_callback *cb,
