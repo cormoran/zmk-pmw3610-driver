@@ -357,24 +357,42 @@ static int pmw3610_async_init_configure(const struct device *dev) {
 
 static void pmw3610_async_init(struct k_work *work) {
     struct k_work_delayable *work2 = (struct k_work_delayable *)work;
-    struct pixart_data *data = CONTAINER_OF(work2, struct pixart_data, init_work);
+    struct pixart_data *data =
+        CONTAINER_OF(work2, struct pixart_data, init_work);
     const struct device *dev = data->dev;
+    int current_step         = data->async_init_step;
+    LOG_INF("PMW3610 async init step %d", current_step);
 
-    LOG_INF("PMW3610 async init step %d", data->async_init_step);
+    if (current_step >= ASYNC_INIT_STEP_COUNT) {
+        LOG_ERR("Invalid async init step %d", current_step);
+        return;
+    }
 
-    data->err = async_init_fn[data->async_init_step](dev);
+    data->err = async_init_fn[current_step](dev);
     if (data->err) {
-        LOG_ERR("PMW3610 initialization failed in step %d", data->async_init_step);
+        if (data->async_init_retry_count < 10) {
+            data->async_init_retry_count++;
+            data->async_init_step = 0;
+            LOG_WRN(
+                "PMW3610 async init step %d failed, retrying from "
+                "beginning(%d/10)",
+                current_step, data->async_init_retry_count);
+            k_work_schedule(&data->init_work,
+                            K_MSEC(async_init_delay[current_step]));
+            return;
+        }
+        LOG_ERR("PMW3610 initialization failed in step %d", current_step);
     } else {
-        data->async_init_step++;
+        int next_step = ++data->async_init_step;
 
-        if (data->async_init_step == ASYNC_INIT_STEP_COUNT) {
-            data->ready = true; // sensor is ready to work
+        if (next_step == ASYNC_INIT_STEP_COUNT) {
+            data->ready = true;  // sensor is ready to work
             LOG_INF("PMW3610 initialized");
             pmw3610_set_interrupt(dev, true);
-        } else {
-            k_work_schedule(&data->init_work, K_MSEC(async_init_delay[data->async_init_step]));
-        }
+        } else if (next_step < ASYNC_INIT_STEP_COUNT) {
+            k_work_schedule(&data->init_work,
+                            K_MSEC(async_init_delay[next_step]));
+        }  // else : can happen by suspend?
     }
 }
 
@@ -504,33 +522,54 @@ static void pmw3610_work_callback(struct k_work *work) {
     pmw3610_set_interrupt(dev, true);
 }
 
-static int pmw3610_init_irq(const struct device *dev) {
+static int pmw3610_enable_irq(const struct device *dev) {
     int err;
-    struct pixart_data *data = dev->data;
+    struct pixart_data *data           = dev->data;
     const struct pixart_config *config = dev->config;
 
-    // check readiness of irq gpio pin
-    if (!device_is_ready(config->irq_gpio.port)) {
-        LOG_ERR("IRQ GPIO device not ready");
-        return -ENODEV;
-    }
-
-    // init the irq pin
     err = gpio_pin_configure_dt(&config->irq_gpio, GPIO_INPUT);
     if (err) {
         LOG_ERR("Cannot configure IRQ GPIO");
         return err;
     }
-
-    // setup and add the irq callback associated
-    gpio_init_callback(&data->irq_gpio_cb, pmw3610_gpio_callback, BIT(config->irq_gpio.pin));
-
     err = gpio_add_callback(config->irq_gpio.port, &data->irq_gpio_cb);
     if (err) {
         LOG_ERR("Cannot add IRQ GPIO callback");
     }
 
     return err;
+}
+
+static int pmw3610_disable_irq(const struct device *dev) {
+    const struct pixart_config *config = dev->config;
+    struct pixart_data *data           = dev->data;
+    int ret                            = pmw3610_set_interrupt(dev, false);
+    if (ret < 0) {
+        return ret;
+    }
+    ret = gpio_pin_configure_dt(&config->irq_gpio, GPIO_DISCONNECTED);
+    if (ret < 0) {
+        return ret;
+    }
+    ret = gpio_remove_callback(config->irq_gpio.port, &data->irq_gpio_cb);
+    return ret;
+}
+
+static int pmw3610_resume(const struct device *dev) {
+    struct pixart_data *data           = dev->data;
+    const struct pixart_config *config = dev->config;
+    int err                            = pmw3610_enable_irq(dev);
+    if (err) {
+        return err;
+    }
+    if (data->ready) {
+        return pmw3610_set_interrupt(dev, true);
+    }
+    data->async_init_step        = 0;
+    data->async_init_retry_count = 0;
+    k_work_schedule(&data->init_work,
+                    K_MSEC(async_init_delay[data->async_init_step]));
+    return 0;
 }
 
 static int pmw3610_init(const struct device *dev) {
@@ -552,21 +591,21 @@ static int pmw3610_init(const struct device *dev) {
     // init trigger handler work
     k_work_init(&data->trigger_work, pmw3610_work_callback);
 
-    // init irq routine
-    err = pmw3610_init_irq(dev);
-    if (err) {
-        return err;
-    }
-
     // Setup delayable and non-blocking init jobs, including following steps:
     // 1. power reset
     // 2. upload initial settings
     // 3. other configs like cpi, downshift time, sample time etc.
-    // The sensor is ready to work (i.e., data->ready=true after the above steps are finished)
+    // The sensor is ready to work (i.e., data->ready=true after the above steps
+    // are finished)
     k_work_init_delayable(&data->init_work, pmw3610_async_init);
 
-    k_work_schedule(&data->init_work, K_MSEC(async_init_delay[data->async_init_step]));
-
+    if (!device_is_ready(config->irq_gpio.port)) {
+        LOG_ERR("IRQ GPIO device not ready");
+        return -ENODEV;
+    }
+    gpio_init_callback(&data->irq_gpio_cb, pmw3610_gpio_callback,
+                       BIT(config->irq_gpio.pin));
+    err = pmw3610_resume(dev);
     return err;
 }
 
@@ -627,49 +666,79 @@ static const struct sensor_driver_api pmw3610_driver_api = {
 
 #if IS_ENABLED(CONFIG_PM_DEVICE)
 
-static int pmw3610_pm_action(const struct device *dev, enum pm_device_action action) {
+static int pmw3610_suspend(const struct device *dev) {
+    const struct pixart_config *config = dev->config;
+    struct pixart_data *data           = dev->data;
+    LOG_DBG("Suspend PMW3610");
+    if (!data->ready) {
+        k_work_cancel_delayable(&data->init_work);
+    }
+    data->ready = false;
+    data->async_init_step =
+        ASYNC_INIT_STEP_COUNT;  // to finish on-going async init step
+    data->async_init_retry_count = 0;
+
+    int ret = pmw3610_disable_irq(dev);
+    if (ret < 0) {
+        return ret;
+    }
+    // Below code doesn't work. PMW3610 doesn't wake up from shutdown mode (if
+    // NCS is always active?)
+    // ret = pmw3610_write_reg(dev, PMW3610_REG_SHUTDOWN,
+    //                         PMW3610_SHUTDOWN_CMD_SHUTDOWN);
+    // if (ret < 0) {
+    //     return ret;
+    // }
+    return 0;
+}
+
+static int pmw3610_pm_action(const struct device *dev,
+                             enum pm_device_action action) {
+    LOG_DBG("pmw3610_pm_action %d", action);
     switch (action) {
     case PM_DEVICE_ACTION_SUSPEND:
-        return pmw3610_set_interrupt(dev, false);
+            return pmw3610_suspend(dev);
     case PM_DEVICE_ACTION_RESUME:
-        return pmw3610_set_interrupt(dev, true);
+            return pmw3610_resume(dev);
     default:
         return -ENOTSUP;
     }
+    return 0;
 }
 
-#endif // IS_ENABLED(CONFIG_PM_DEVICE)
+#endif  // IS_ENABLED(CONFIG_PM_DEVICE)
 
-#define PMW3610_SPI_MODE (SPI_OP_MODE_MASTER | SPI_WORD_SET(8) | SPI_MODE_CPOL | \
-                        SPI_MODE_CPHA | SPI_TRANSFER_MSB)
+#define PMW3610_SPI_MODE                                                    \
+    (SPI_OP_MODE_MASTER | SPI_WORD_SET(8) | SPI_MODE_CPOL | SPI_MODE_CPHA | \
+     SPI_TRANSFER_MSB)
 
-#define PMW3610_DEFINE(n)                                                                          \
-    static struct pixart_data data##n;                                                             \
-    static const struct pixart_config config##n = {                                                \
-		.spi = SPI_DT_SPEC_INST_GET(n, PMW3610_SPI_MODE, 0),		                               \
-        .irq_gpio = GPIO_DT_SPEC_INST_GET(n, irq_gpios),                                           \
-        .cpi = DT_PROP(DT_DRV_INST(n), cpi),                                                       \
-        .evt_type = DT_PROP(DT_DRV_INST(n), evt_type),                                             \
-        .x_input_code = DT_PROP(DT_DRV_INST(n), x_input_code),                                     \
-        .y_input_code = DT_PROP(DT_DRV_INST(n), y_input_code),                                     \
-        .force_awake = DT_PROP(DT_DRV_INST(n), force_awake),                                       \
-        .disable_burst_read = DT_PROP(DT_DRV_INST(n), disable_burst_read),                         \
-    };                                                                                             \
-    PM_DEVICE_DT_INST_DEFINE(n, pmw3610_pm_action);                                                \
-    DEVICE_DT_INST_DEFINE(n, pmw3610_init, NULL, &data##n, &config##n, POST_KERNEL,                \
-                          CONFIG_INPUT_PMW3610_INIT_PRIORITY, &pmw3610_driver_api);
+#define PMW3610_DEFINE(n)                                                   \
+    static struct pixart_data data##n;                                      \
+    static const struct pixart_config config##n = {                         \
+        .spi                = SPI_DT_SPEC_INST_GET(n, PMW3610_SPI_MODE, 0), \
+        .irq_gpio           = GPIO_DT_SPEC_INST_GET(n, irq_gpios),          \
+        .cpi                = DT_PROP(DT_DRV_INST(n), cpi),                 \
+        .evt_type           = DT_PROP(DT_DRV_INST(n), evt_type),            \
+        .x_input_code       = DT_PROP(DT_DRV_INST(n), x_input_code),        \
+        .y_input_code       = DT_PROP(DT_DRV_INST(n), y_input_code),        \
+        .force_awake        = DT_PROP(DT_DRV_INST(n), force_awake),         \
+        .disable_burst_read = DT_PROP(DT_DRV_INST(n), disable_burst_read),  \
+    };                                                                      \
+    PM_DEVICE_DT_INST_DEFINE(n, pmw3610_pm_action);                         \
+    DEVICE_DT_INST_DEFINE(                                                  \
+        n, pmw3610_init, PM_DEVICE_DT_INST_GET(n), &data##n, &config##n,    \
+        POST_KERNEL, CONFIG_INPUT_PMW3610_INIT_PRIORITY, &pmw3610_driver_api);
 
 DT_INST_FOREACH_STATUS_OKAY(PMW3610_DEFINE)
-
 
 #define GET_PMW3610_DEV(node_id) DEVICE_DT_GET(node_id),
 
 static const struct device *pmw3610_devs[] = {
-    DT_FOREACH_STATUS_OKAY(pixart_pmw3610, GET_PMW3610_DEV)
-};
+    DT_FOREACH_STATUS_OKAY(pixart_pmw3610, GET_PMW3610_DEV)};
 
 static int on_activity_state(const zmk_event_t *eh) {
-    struct zmk_activity_state_changed *state_ev = as_zmk_activity_state_changed(eh);
+    struct zmk_activity_state_changed *state_ev =
+        as_zmk_activity_state_changed(eh);
 
     if (!state_ev) {
         LOG_WRN("NO EVENT, leaving early");
@@ -677,6 +746,7 @@ static int on_activity_state(const zmk_event_t *eh) {
     }
 
     bool enable = state_ev->state == ZMK_ACTIVITY_ACTIVE ? 1 : 0;
+    LOG_DBG("Change PMW3610 performance to %s", enable ? "active" : "inactive");
     for (size_t i = 0; i < ARRAY_SIZE(pmw3610_devs); i++) {
         pmw3610_set_performance(pmw3610_devs[i], enable);
     }

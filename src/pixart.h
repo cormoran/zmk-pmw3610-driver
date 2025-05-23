@@ -17,23 +17,25 @@ extern "C" {
 
 /* device data structure */
 struct pixart_data {
-    const struct device          *dev;
-    bool                         sw_smart_flag; // for pmw3610 smart algorithm
+    const struct device *dev;
+    bool sw_smart_flag;  // for pmw3610 smart algorithm
 
-    struct gpio_callback         irq_gpio_cb; // motion pin irq callback
-    struct k_work                trigger_work; // realtrigger job
+    struct gpio_callback irq_gpio_cb;  // motion pin irq callback
+    struct k_work trigger_work;        // realtrigger job
 
-    struct k_work_delayable      init_work; // the work structure for delayable init steps
-    int                          async_init_step;
+    struct k_work_delayable
+        init_work;  // the work structure for delayable init steps
+    int async_init_step;
+    int async_init_retry_count;  // retry count for async init
 
-    bool                         ready; // whether init is finished successfully
-    bool                         last_read_burst;
-    int                          err; // error code during async init
+    bool ready;  // whether init is finished successfully
+    bool last_read_burst;
+    int err;  // error code during async init
 };
 
 // device config data structure
 struct pixart_config {
-	struct spi_dt_spec spi;
+    struct spi_dt_spec spi;
     struct gpio_dt_spec irq_gpio;
     uint16_t cpi;
     uint8_t evt_type;
